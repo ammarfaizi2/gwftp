@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <netdb.h>
+#include <poll.h>
 
 static const uint16_t gwftp_default_port = 9921;
 static const uint32_t gwftp_max_clients = 512;
@@ -52,7 +53,7 @@ static int resolve_addr(struct sockaddr_storage *ss, const char *addr,
 
 	err = getaddrinfo(addr, NULL, &hints, &res);
 	if (err) {
-		pr_err("Failed to resolve address: %s\n", gai_strerror(err));
+		pr_err("Failed to resolve address: %s", gai_strerror(err));
 		return -err;
 	}
 
@@ -67,7 +68,7 @@ static int resolve_addr(struct sockaddr_storage *ss, const char *addr,
 		((struct sockaddr_in6 *)ss)->sin6_port = htons(port);
 		break;
 	default:
-		pr_err("Unsupported address family: %d\n", ss->ss_family);
+		pr_err("Unsupported address family: %d", ss->ss_family);
 		return -EINVAL;
 	}
 
@@ -82,6 +83,8 @@ static void server_sig_handler(int signum)
 		putchar('\n');
 		s_ctx->should_stop = true;
 	}
+
+	(void)signum;
 }
 
 static int server_setup_sigaction(struct gwftp_server_ctx *ctx)
@@ -100,7 +103,7 @@ static int server_setup_sigaction(struct gwftp_server_ctx *ctx)
 	err |= sigaction(SIGPIPE, &sa, NULL);
 	if (err) {
 		s_ctx = NULL;
-		pr_err("Failed to setup signal handler: %s\n", strerror(errno));
+		pr_err("Failed to setup signal handler: %s", strerror(errno));
 		return -EOPNOTSUPP;
 	}
 
@@ -114,14 +117,14 @@ static int server_init_client_slots(struct gwftp_server_ctx *ctx)
 
 	err = gwftp_stack_init(&ctx->cl_stack, ctx->max_clients);
 	if (err) {
-		pr_err("Failed to initialize stack: %s\n", strerror(-err));
+		pr_err("Failed to initialize stack: %s", strerror(-err));
 		return err;
 	}
 
 	ctx->clients = calloc(gwftp_max_clients, sizeof(*ctx->clients));
 	if (!ctx->clients) {
 		gwftp_stack_free(&ctx->cl_stack);
-		pr_err("Failed to allocate memory\n");
+		pr_err("Failed to allocate memory");
 		return -ENOMEM;
 	}
 
@@ -150,20 +153,12 @@ static int server_init_sock(struct gwftp_server_ctx *ctx)
 	struct sockaddr_storage addr;
 	socklen_t addr_len = 0;
 
-	if (ctx->cfg.event == GWFTP_EVENT_EPOLL)
-		type |= SOCK_NONBLOCK;
-
-	fd = socket(AF_INET6, type, 0);
-	if (fd < 0) {
-		err = -errno;
-		pr_err("Failed to create socket: %s\n", strerror(-err));
-		return err;
-	}
-
 	memset(&addr, 0, sizeof(addr));
 	err = resolve_addr(&addr, ctx->cfg.bind_addr, ctx->cfg.bind_port);
-	if (err)
-		goto out_err;
+	if (err) {
+		pr_err("Failed to resolve address: %s", strerror(-err));
+		return err;
+	}
 
 	switch (addr.ss_family) {
 	case AF_INET:
@@ -174,21 +169,33 @@ static int server_init_sock(struct gwftp_server_ctx *ctx)
 		break;
 	}
 
+	if (ctx->cfg.event == GWFTP_EVENT_EPOLL)
+		type |= SOCK_NONBLOCK;
+
+	fd = socket(addr.ss_family, type, 0);
+	if (fd < 0) {
+		err = -errno;
+		pr_err("Failed to create socket: %s", strerror(-err));
+		return err;
+	}
+
 	err = bind(fd, (struct sockaddr *)&addr, addr_len);
 	if (err) {
 		err = -errno;
-		pr_err("Failed to bind socket: %s\n", strerror(-err));
+		pr_err("Failed to bind socket: %s", strerror(-err));
 		goto out_err;
 	}
 
 	err = listen(fd, 1024);
 	if (err) {
 		err = -errno;
-		pr_err("Failed to listen on socket: %s\n", strerror(-err));
+		pr_err("Failed to listen on socket: %s", strerror(-err));
 		goto out_err;
 	}
 
 	ctx->tcp_fd = fd;
+
+	pr_info("Listening on %s:%hu...", ctx->cfg.bind_addr, ctx->cfg.bind_port);
 	return 0;
 
 out_err:
@@ -218,7 +225,7 @@ static int server_init_ctx(struct gwftp_server_ctx *ctx)
 	err = chdir(ctx->cfg.root_dir);
 	if (err) {
 		err = -errno;
-		pr_err("Failed to change directory: %s\n", strerror(-err));
+		pr_err("Failed to change directory: %s", strerror(-err));
 		return err;
 	}
 
@@ -278,7 +285,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 		case 'a':
 			cfg->bind_addr = strdup(optarg);
 			if (!cfg->bind_addr) {
-				pr_err("Failed to allocate memory\n");
+				pr_err("Failed to allocate memory");
 				return -ENOMEM;
 			}
 			break;
@@ -290,7 +297,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 		case 'r':
 			cfg->root_dir = strdup(optarg);
 			if (!cfg->root_dir) {
-				pr_err("Failed to allocate memory\n");
+				pr_err("Failed to allocate memory");
 				return -ENOMEM;
 			}
 			break;
@@ -301,7 +308,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 			} else if (!strcmp(optarg, "io_uring")) {
 				cfg->event = GWFTP_EVENT_IO_URING;
 			} else {
-				pr_err("Unsupported event: %s\n", optarg);
+				pr_err("Unsupported event: %s", optarg);
 				return -EINVAL;
 			}
 			break;
@@ -316,7 +323,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 			__builtin_unreachable();
 		
 		default:
-			pr_err("Unknown option: %s\n", argv[optind - 1]);
+			pr_err("Unknown option: %s", argv[optind - 1]);
 			show_server_help(app);
 			return -EINVAL;
 		}
@@ -325,7 +332,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 	if (!cfg->bind_addr) {
 		cfg->bind_addr = strdup("::");
 		if (!cfg->bind_addr) {
-			pr_err("Failed to allocate memory\n");
+			pr_err("Failed to allocate memory");
 			return -ENOMEM;
 		}
 	}
@@ -333,7 +340,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 	if (!cfg->root_dir) {
 		cfg->root_dir = strdup(".");
 		if (!cfg->root_dir) {
-			pr_err("Failed to allocate memory\n");
+			pr_err("Failed to allocate memory");
 			return -ENOMEM;
 		}
 	}
@@ -361,11 +368,11 @@ static int gwftp_server_run(int argc, char *argv[], const char *app)
 		err = gwftp_server_run_ev_epoll(&ctx);
 		break;
 	case GWFTP_EVENT_IO_URING:
-		pr_err("Unsupported event: io_uring\n");
+		pr_err("Unsupported event: io_uring");
 		err = -EOPNOTSUPP;
 		break;
 	default:
-		pr_err("Unsupported event: %d\n", ctx.cfg.event);
+		pr_err("Unsupported event: %d", ctx.cfg.event);
 		err = -EOPNOTSUPP;
 		break;
 	}
@@ -374,9 +381,229 @@ out:
 	return err;
 }
 
+static struct gwftp_client_ctx *c_ctx;
+
+static void client_sig_handler(int signum)
+{
+	if (c_ctx && !c_ctx->should_stop) {
+		putchar('\n');
+		c_ctx->should_stop = true;
+	}
+
+	(void)signum;
+}
+
+static int client_setup_sigaction(struct gwftp_client_ctx *ctx)
+{
+	struct sigaction sa = {
+		.sa_handler = client_sig_handler,
+		.sa_flags = 0,
+	};
+	int err = 0;
+
+	c_ctx = ctx;
+	err |= sigaction(SIGINT, &sa, NULL);
+	err |= sigaction(SIGTERM, &sa, NULL);
+	err |= sigaction(SIGQUIT, &sa, NULL);
+	sa.sa_handler = SIG_IGN;
+	err |= sigaction(SIGPIPE, &sa, NULL);
+	if (err) {
+		c_ctx = NULL;
+		pr_err("Failed to setup signal handler: %s", strerror(errno));
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int client_init_sock(struct gwftp_client_ctx *ctx)
+{
+	int err, fd, type = SOCK_STREAM;
+	struct sockaddr_storage addr;
+	socklen_t addr_len = 0;
+
+	memset(&addr, 0, sizeof(addr));
+	err = resolve_addr(&addr, ctx->cfg.server_addr, ctx->cfg.server_port);
+	if (err) {
+		pr_err("Failed to resolve address: %s", strerror(-err));
+		return err;
+	}
+
+	switch (addr.ss_family) {
+	case AF_INET:
+		addr_len = sizeof(struct sockaddr_in);
+		break;
+	case AF_INET6:
+		addr_len = sizeof(struct sockaddr_in6);
+		break;
+	}
+
+	if (ctx->cfg.event == GWFTP_EVENT_EPOLL)
+		type |= SOCK_NONBLOCK;
+
+	fd = socket(addr.ss_family, type, 0);
+	if (fd < 0) {
+		err = -errno;
+		pr_err("Failed to create socket: %s", strerror(-err));
+		return err;
+	}
+
+	pr_info("Connecting to %s:%hu...", ctx->cfg.server_addr, ctx->cfg.server_port);
+	err = connect(fd, (struct sockaddr *)&addr, addr_len);
+	if (err) {
+		struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+
+		err = -errno;
+		if (err != -EINPROGRESS) {
+			pr_err("Failed to connect to server: %s", strerror(-err));
+			close(fd);
+			return err;
+		}
+
+		err = poll(&pfd, 1, 10000);
+		if (err <= 0) {
+			if (err == 0)
+				err = -ETIMEDOUT;
+
+			pr_err("Failed to connect to server: %s", strerror(-err));
+			close(fd);
+			return err;
+		}
+	}
+
+	ctx->tcp_fd = fd;
+	pr_info("Connected to %s:%hu...", ctx->cfg.server_addr, ctx->cfg.server_port);
+	return 0;
+}
+
+static void client_free_sock(struct gwftp_client_ctx *ctx)
+{
+	if (ctx->tcp_fd >= 0) {
+		close(ctx->tcp_fd);
+		ctx->tcp_fd = -1;
+	}
+}
+
+static int client_init_ctx(struct gwftp_client_ctx *ctx)
+{
+	int err;
+
+	ctx->should_stop = false;
+	ctx->tcp_fd = -1;
+
+	err = client_setup_sigaction(ctx);
+	if (err)
+		return err;
+
+	err = client_init_sock(ctx);
+	if (err)
+		return err;
+
+	return 0;
+}
+
+static void client_free_cfg(struct gwftp_client_cfg *cfg)
+{
+	free(cfg->server_addr);
+}
+
+static void client_free_ctx(struct gwftp_client_ctx *ctx)
+{
+	client_free_cfg(&ctx->cfg);
+	client_free_sock(ctx);
+}
+
+static void show_client_help(const char *app)
+{
+	printf("Usage: %s client [options]\n", app);
+	printf("Options:\n");
+	printf("  -a, --server-addr=ADDR\tServer address\n");
+	printf("  -p, --server-port=PORT\tServer port\n");
+	printf("  -e, --event=EVENT\tEvent type (epoll, io_uring)\n");
+	printf("  -h, --help\t\tDisplay this help message\n");
+	printf("  -v, --version\t\tDisplay version\n");
+}
+
+static int client_parse_args(int argc, char *argv[], const char *app,
+			     struct gwftp_client_cfg *cfg)
+{
+	int idx;
+
+	cfg->server_port = gwftp_default_port;
+	cfg->event = GWFTP_EVENT_EPOLL;
+
+	while (1) {
+		int c = getopt_long(argc, argv, client_short_options,
+				    client_options, &idx);
+		if (c == -1)
+			break;
+
+		switch (c) {
+		case 'a':
+			cfg->server_addr = strdup(optarg);
+			if (!cfg->server_addr) {
+				pr_err("Failed to allocate memory");
+				return -ENOMEM;
+			}
+			break;
+
+		case 'p':
+			cfg->server_port = atoi(optarg);
+			break;
+
+		case 'e':
+			if (!strcmp(optarg, "epoll")) {
+				cfg->event = GWFTP_EVENT_EPOLL;
+			} else if (!strcmp(optarg, "io_uring")) {
+				cfg->event = GWFTP_EVENT_IO_URING;
+			} else {
+				pr_err("Unsupported event: %s", optarg);
+				return -EINVAL;
+			}
+			break;
+
+		case 'h':
+			show_client_help(app);
+			return -EINVAL;
+
+		case 'v':
+			printf("gwftp v0.1\n");
+			exit(0);
+			__builtin_unreachable();
+
+		default:
+			pr_err("Unknown option: %s", argv[optind - 1]);
+			show_client_help(app);
+			return -EINVAL;
+		}
+	}
+
+	if (!cfg->server_addr) {
+		pr_err("Server address is required");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int gwftp_client_run(int argc, char *argv[], const char *app)
 {
-	return 0;
+	struct gwftp_client_ctx ctx;
+	int err;
+
+	err = client_parse_args(argc, argv, app, &ctx.cfg);
+	if (err) {
+		client_free_cfg(&ctx.cfg);
+		return err;
+	}
+
+	err = client_init_ctx(&ctx);
+	if (err)
+		goto out;
+
+out:
+	client_free_ctx(&ctx);
+	return err;
 }
 
 int main(int argc, char *argv[])

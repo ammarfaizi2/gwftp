@@ -12,7 +12,9 @@
 #include <linux/types.h>
 #include <netinet/in.h>
 
-#define pr_err(fmt, ...) fprintf(stderr, "Error: " fmt "\n", ##__VA_ARGS__)
+#define pr_err(fmt, ...)	fprintf(stderr, "err  : " fmt "\n", ##__VA_ARGS__)
+#define pr_dbg(fmt, ...)	fprintf(stderr, "dbg  : " fmt "\n", ##__VA_ARGS__)
+#define pr_info(fmt, ...)	fprintf(stdout, "info : " fmt "\n", ##__VA_ARGS__)
 
 #ifndef __packed
 #define __packed __attribute__((__packed__))
@@ -125,10 +127,27 @@ struct gwftp_server_ctx {
 	struct gw_stack			cl_stack;
 
 	union {
-		struct gwftp_ev_epoll	*ev_epoll;
+		struct gwftp_srv_ev_epoll	*ev_epoll;
 	};
 
 	struct gwftp_server_cfg		cfg;
+};
+
+struct gwftp_client_cfg {
+	char		*server_addr;
+	uint16_t	server_port;
+	uint8_t		event;
+};
+
+struct gwftp_client_ctx {
+	volatile bool			should_stop;
+	int				tcp_fd;
+
+	union {
+		struct gwftp_cli_ev_epoll	*ev_epoll;
+	};
+
+	struct gwftp_client_cfg		cfg;
 };
 
 #endif /* #ifndef GWFTP__GWFTP_H */
