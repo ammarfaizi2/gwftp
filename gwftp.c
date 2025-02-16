@@ -626,53 +626,13 @@ out:
 	return err;
 }
 
-static int server_validate_cl_pkt_hdr_handshake(struct gwftp_pkt *pkt,
-						struct gwftp_client *cl)
+static int server_consume_cl_packet(struct gwftp_server_ctx *ctx,
+				    struct gwftp_client *cl,
+				    struct gwftp_pkt *pkt)
 {
-	struct gwftp_pkt_hdr *hdr = &pkt->hdr;
-
-	if (unlikely(cl->state != GWFTP_SRV_CL_STATE_INIT)) {
-		pr_dbg("Handshake packet received in invalid state: %u",
-		       cl->state);
-		return -EBADMSG;
-	}
-
-	if (unlikely(hdr->len != sizeof(struct gwftp_pkt_handshake))) {
-		pr_dbg("Invalid handshake packet length: %u, expected %zu",
-		       hdr->len, sizeof(struct gwftp_pkt_handshake));
-		return -EBADMSG;
-	}
-
-	return 0;
-}
-
-__hot
-int gwftp_server_validate_cl_pkt_hdr(struct gwftp_pkt *pkt, struct gwftp_client *cl)
-{
-	int ret;
-
-	if (unlikely(pkt->hdr.resv)) {
-		pr_err("Invalid reserved field: %u, expected 0", pkt->hdr.resv);
-		return -EBADMSG;
-	}
-
-	switch (pkt->hdr.type) {
-	case GWFTP_PKT_TYPE_HANDSHAKE:
-		ret = server_validate_cl_pkt_hdr_handshake(pkt, cl);
-		break;
-	default:
-		pr_err("Unsupported packet type: %u", pkt->hdr.type);
-		ret = -EBADMSG;
-		break;
-	}
-
-	return ret;
-}
-
-__hot
-int gwftp_server_validate_cl_pkt_body(struct gwftp_pkt *pkt, struct gwftp_client *cl)
-{
-
+	(void)ctx;
+	(void)cl;
+	(void)pkt;
 	return 0;
 }
 

@@ -12,7 +12,8 @@ SOURCES	= \
 	ev_epoll.c \
 	ev_io_uring.c \
 	gw_stack.c \
-	gwftp.c
+	gwftp.c \
+	validator.c
 
 DEFINE_FLAGS = \
 	-D_GNU_SOURCE \

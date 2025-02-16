@@ -250,7 +250,4 @@ struct gwftp_client_ctx {
 	struct gwftp_client_cfg		cfg;
 };
 
-int gwftp_server_validate_cl_pkt_hdr(struct gwftp_pkt *pkt, struct gwftp_client *cl);
-int gwftp_server_validate_cl_pkt_body(struct gwftp_pkt *pkt, struct gwftp_client *cl);
-
 #endif /* #ifndef GWFTP__GWFTP_H */
