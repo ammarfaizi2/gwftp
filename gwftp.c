@@ -20,7 +20,7 @@
 static const uint16_t gwftp_default_port = 9921;
 static const uint32_t gwftp_max_clients = 512;
 
-static const char server_short_options[] = "a:p:w:e:h";
+static const char server_short_options[] = "a:p:r:e:hv";
 static const struct option server_options[] = {
 	{ "bind-addr",		required_argument,	NULL, 'a' },
 	{ "bind-port",		required_argument,	NULL, 'p' },
@@ -31,7 +31,7 @@ static const struct option server_options[] = {
 	{ NULL, 		0,			NULL, 0 }
 };
 
-static const char client_short_options[] = "a:p:e:h";
+static const char client_short_options[] = "a:p:e:hv";
 static const struct option client_options[] = {
 	{ "server-addr",	required_argument,	NULL, 'a' },
 	{ "server-port",	required_argument,	NULL, 'p' },
@@ -318,7 +318,7 @@ static int server_parse_args(int argc, char *argv[],const char *app,
 			return -EINVAL;
 
 		case 'v':
-			printf("gwftp v0.1\n");
+			printf("gwftp v%s\n", GWFTP_VERSION);
 			exit(0);
 			__builtin_unreachable();
 		
@@ -567,7 +567,7 @@ static int client_parse_args(int argc, char *argv[], const char *app,
 			return -EINVAL;
 
 		case 'v':
-			printf("gwftp v0.1\n");
+			printf("gwftp v%s\n", GWFTP_VERSION);
 			exit(0);
 			__builtin_unreachable();
 
@@ -600,6 +600,20 @@ static int gwftp_client_run(int argc, char *argv[], const char *app)
 	err = client_init_ctx(&ctx);
 	if (err)
 		goto out;
+
+	switch (ctx.cfg.event) {
+	case GWFTP_EVENT_EPOLL:
+		err = gwftp_client_run_ev_epoll(&ctx);
+		break;
+	case GWFTP_EVENT_IO_URING:
+		pr_err("Unsupported event: io_uring");
+		err = -EOPNOTSUPP;
+		break;
+	default:
+		pr_err("Unsupported event: %d", ctx.cfg.event);
+		err = -EOPNOTSUPP;
+		break;
+	}
 
 out:
 	client_free_ctx(&ctx);

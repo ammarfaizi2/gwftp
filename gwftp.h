@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
+#include <assert.h>
 
 #include <linux/types.h>
 #include <netinet/in.h>
@@ -20,9 +22,14 @@
 #define __packed __attribute__((__packed__))
 #endif
 
+#ifndef offsetof
+#define offsetof(type, member)	__builtin_offsetof(type, member)
+#endif
+
 typedef uint8_t u8;
 
 #define GWFTP_PATH_MAX 4096
+#define GWFTP_HANDSHAKE_MAGIC 0xaabbccdd
 
 struct gwftp_pkt_hdr {
 	u8	type;
@@ -31,6 +38,7 @@ struct gwftp_pkt_hdr {
 } __packed;
 
 struct gwftp_pkt_handshake {
+	__be32	magic;
 	u8	major;
 	u8	minor;
 	u8	patch;
@@ -38,6 +46,7 @@ struct gwftp_pkt_handshake {
 } __packed;
 
 struct gwftp_pkt_handshake_res {
+	__be32	magic;
 	u8	status;
 	u8	resv[3];
 	u8	major;
@@ -97,6 +106,63 @@ struct gwftp_pkt {
 	};
 } __packed;
 
+static inline size_t prep_pkt(struct gwftp_pkt *pkt, u8 type, size_t len)
+{
+	assert(len <= UINT16_MAX);
+
+	pkt->hdr.type = type;
+	pkt->hdr.resv = 0;
+	pkt->hdr.len = htons(len);
+	return sizeof(pkt->hdr) + len;
+}
+
+static inline size_t prep_pkt_handshake(struct gwftp_pkt *pkt, u8 major,
+					u8 minor, u8 patch, const char *extra)
+{
+	pkt->hs.magic = htonl(GWFTP_HANDSHAKE_MAGIC);
+	pkt->hs.major = major;
+	pkt->hs.minor = minor;
+	pkt->hs.patch = patch;
+	strncpy((char *)pkt->hs.extra, extra, sizeof(pkt->hs.extra));
+	return prep_pkt(pkt, GWFTP_PKT_TYPE_HANDSHAKE, sizeof(pkt->hs));
+}
+
+static inline size_t prep_pkt_handshake_res(struct gwftp_pkt *pkt, u8 status,
+					    u8 major, u8 minor, u8 patch,
+					    const char *extra)
+{
+	pkt->hs_res.magic = htonl(GWFTP_HANDSHAKE_MAGIC);
+	pkt->hs_res.status = status;
+	pkt->hs_res.major = major;
+	pkt->hs_res.minor = minor;
+	pkt->hs_res.patch = patch;
+	strncpy((char *)pkt->hs_res.extra, extra, sizeof(pkt->hs_res.extra));
+	return prep_pkt(pkt, GWFTP_PKT_TYPE_HANDSHAKE_RESP, sizeof(pkt->hs_res));
+}
+
+static inline size_t prep_pkt_cmd(struct gwftp_pkt *pkt, u8 cmd, __be64 id,
+				  __be64 flags, const char *arg)
+{
+	size_t len = strlen(arg);
+	size_t pkt_len = offsetof(struct gwftp_pkt_cmd, arg) + len;
+
+	pkt->cmd.id = id;
+	pkt->cmd.flags = flags;
+	pkt->cmd.arg_len = htons(len);
+	pkt->cmd.cmd = cmd;
+	strncpy((char *)pkt->cmd.arg, arg, sizeof(pkt->cmd.arg));
+	return prep_pkt(pkt, GWFTP_PKT_TYPE_CMD, pkt_len);
+}
+
+static inline size_t prep_pkt_cmd_res(struct gwftp_pkt *pkt, u8 cmd, __be64 id,
+				      u8 is_end_of_res)
+{
+	pkt->cmd_res.id = id;
+	pkt->cmd_res.cmd = cmd;
+	pkt->cmd_res.is_end_of_res = is_end_of_res;
+	return prep_pkt(pkt, GWFTP_PKT_TYPE_CMD_RESP, sizeof(pkt->cmd_res));
+}
+
 enum {
 	GWFTP_EVENT_EPOLL	= 0x01,
 	GWFTP_EVENT_IO_URING	= 0x02,
@@ -139,14 +205,25 @@ struct gwftp_client_cfg {
 	uint8_t		event;
 };
 
+enum {
+	GWFTP_CL_STATE_INIT		= 0x00,
+	GWFTP_CL_STATE_HANDSHAKE	= 0x01,
+	GWFTP_CL_STATE_ESTABLISHED	= 0x02,
+};
+
 struct gwftp_client_ctx {
 	volatile bool			should_stop;
+	uint8_t				state;
 	int				tcp_fd;
 
 	union {
 		struct gwftp_cli_ev_epoll	*ev_epoll;
 	};
 
+	size_t				rx_len;
+	size_t				tx_len;
+	struct gwftp_pkt		rx_pkt;
+	struct gwftp_pkt		tx_pkt;
 	struct gwftp_client_cfg		cfg;
 };
 

@@ -13,13 +13,17 @@
 
 static const uint32_t epoll_max_events = 128;
 
-#define EPL_EV_MASK (0xffffull << 48ull)
-#define EPL_GET_EV(ev) ((ev) & EPL_EV_MASK)
-#define EPL_CLEAR_EV(ev) ((ev) & ~EPL_EV_MASK)
+#define EPL_EV_MASK		(0xffffull << 48ull)
+#define EPL_GET_EV(ev)		((ev) & EPL_EV_MASK)
+#define EPL_CLEAR_EV(ev)	((ev) & ~EPL_EV_MASK)
 
 enum {
-	SRV_EV_ACCEPT		= (0x0001ull << 48ull),
-	SRV_EV_RECV		= (0x0002ull << 48ull),
+	SRV_EV_ACCEPT	= (0x0001ull << 48ull),
+	SRV_EV_CLIENT	= (0x0002ull << 48ull),
+};
+
+enum {
+	CLI_EV_SERVER	= (0x0001ull << 48ull),
 };
 
 static int epoll_add(int ep_fd, int fd, uint32_t events, union epoll_data data)
@@ -124,7 +128,7 @@ static int server_handle_accept(struct gwftp_server_ctx *ctx)
 
 	data.u64 = 0;
 	data.ptr = cl;
-	data.u64 |= SRV_EV_RECV;
+	data.u64 |= SRV_EV_CLIENT;
 	err = epoll_add(ep->ep_fd, fd, EPOLLIN, data);
 	if (err) {
 		close(fd);
@@ -215,7 +219,7 @@ static int server_handle_event(struct gwftp_server_ctx *ctx,
 	switch (ev) {
 	case SRV_EV_ACCEPT:
 		return server_handle_accept(ctx);
-	case SRV_EV_RECV:
+	case SRV_EV_CLIENT:
 		return server_handle_recv(ctx, ee->data.ptr);
 	}
 
@@ -344,8 +348,203 @@ int gwftp_server_run_ev_epoll(struct gwftp_server_ctx *ctx)
 	return ret;
 }
 
+static int client_poll_events(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_cli_ev_epoll *ep = ctx->ev_epoll;
+	int ret;
+
+	ret = epoll_wait(ep->ep_fd, ep->events, 2, ep->timeout);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EINTR)
+			return 0;
+
+		pr_err("Failed to wait for events: %s\n", strerror(-ret));
+		return ret;
+	}
+
+	return ret;
+}
+
+static int server_handle_server_recv(struct gwftp_client_ctx *ctx)
+{
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	buf = (char *)&ctx->rx_pkt + ctx->rx_len;
+	len = sizeof(ctx->rx_pkt) - ctx->rx_len;
+	ret = recv(ctx->tcp_fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret != -EAGAIN && ret != -EINTR) {
+			pr_err("Failed to receive data: %s\n", strerror(-ret));
+			return ret;
+		}
+
+		return 0;
+	}
+
+	if (!ret) {
+		pr_err("Server disconnected!");
+		ctx->should_stop = true;
+		return -ECONNRESET;
+	}
+
+	return 0;
+}
+
+static int server_handle_server_send(struct gwftp_client_ctx *ctx)
+{
+	return 0;
+}
+
+static int client_handle_server(struct gwftp_client_ctx *ctx, uint32_t events)
+{
+	int ret;
+
+	if (events & (EPOLLERR | EPOLLHUP)) {
+		pr_err("Server disconnected!");
+		ctx->should_stop = true;
+		return -ECONNRESET;
+	}
+
+	if (events & EPOLLIN) {
+		ret = server_handle_server_recv(ctx);
+		if (ret)
+			return ret;
+	}
+
+	if (events & EPOLLOUT) {
+		ret = server_handle_server_send(ctx);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int client_handle_event(struct gwftp_client_ctx *ctx,
+			       struct epoll_event *ee)
+{
+	uint64_t ev = EPL_GET_EV(ee->data.u64);
+	uint64_t ev_data = EPL_CLEAR_EV(ee->data.u64);
+
+	ee->data.u64 = ev_data;
+	switch (ev) {
+	case CLI_EV_SERVER:
+		return client_handle_server(ctx, ee->events);
+	}
+
+	return 0;
+}
+
+static int client_handle_events(struct gwftp_client_ctx *ctx, int nr_events)
+{
+	struct gwftp_cli_ev_epoll *ep = ctx->ev_epoll;
+	struct epoll_event *events = ep->events;
+	int i, ret = 0;
+
+	for (i = 0; i < nr_events; i++) {
+		ret = client_handle_event(ctx, &events[i]);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+static int client_send_handshake(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt *tx = &ctx->tx_pkt;
+	ssize_t ret;
+	size_t len;
+
+	len = prep_pkt_handshake(tx, GWFTP_VERSION_MAJOR, GWFTP_VERSION_MINOR,
+				 GWFTP_VERSION_PATCH, GWFTP_VERSION_EXTRA);
+
+	ret = send(ctx->tcp_fd, tx, len, 0);
+	if (ret < 0) {
+		ret = -errno;
+		pr_err("Failed to send handshake: %s\n", strerror(-ret));
+		return ret;
+	}
+
+	if ((size_t)ret != len) {
+		pr_err("Failed to send complete handshake: %s\n", strerror(-EIO));
+		return -EIO;
+	}
+
+	ctx->state = GWFTP_CL_STATE_HANDSHAKE;
+	return 0;
+}
+
+static int client_init_epoll(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_cli_ev_epoll *ep = malloc(sizeof(*ep));
+	union epoll_data data;
+	int err;
+
+	if (!ep)
+		return -ENOMEM;
+
+	ep->ep_fd = epoll_create(2);
+	if (ep->ep_fd < 0) {
+		err = -errno;
+		free(ep);
+		return err;
+	}
+
+	data.u64 = CLI_EV_SERVER;
+	err = epoll_add(ep->ep_fd, ctx->tcp_fd, EPOLLIN, data);
+	if (err) {
+		close(ep->ep_fd);
+		free(ep);
+		return err;
+	}
+
+	ep->timeout = -1;
+	ctx->ev_epoll = ep;
+
+	return 0;
+}
+
+static void client_free_epoll(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_cli_ev_epoll *ep = ctx->ev_epoll;
+
+	if (!ep)
+		return;
+
+	if (ep->ep_fd >= 0)
+		close(ep->ep_fd);
+
+	free(ep);
+}
+
 int gwftp_client_run_ev_epoll(struct gwftp_client_ctx *ctx)
 {
-	(void)ctx;
-	return 0;
+	int ret;
+
+	ctx->state = GWFTP_CL_STATE_INIT;
+	ret = client_send_handshake(ctx);
+	if (ret)
+		return ret;
+
+	ret = client_init_epoll(ctx);
+	if (ret)
+		return ret;
+
+	while (!ctx->should_stop) {
+		ret = client_poll_events(ctx);
+		if (ret)
+			break;
+
+		ret = client_handle_events(ctx, ret);
+		if (ret)
+			break;
+	}
+
+	client_free_epoll(ctx);
+	return ret;
 }

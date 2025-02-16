@@ -20,7 +20,7 @@ struct gwftp_cli_ev_epoll {
 	int			ev_fd;
 	int			timeout;
 	uint32_t		max_events;
-	struct epoll_event	*events;
+	struct epoll_event	events[2];
 };
 
 struct gwftp_server_ctx;
