@@ -18,6 +18,22 @@
 #define pr_dbg(fmt, ...)	fprintf(stderr, "dbg  : " fmt "\n", ##__VA_ARGS__)
 #define pr_info(fmt, ...)	fprintf(stdout, "info : " fmt "\n", ##__VA_ARGS__)
 
+#ifndef likely
+#define likely(x)	__builtin_expect(!!(x), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(x)	__builtin_expect(!!(x), 0)
+#endif
+
+#ifndef __hot
+#define __hot		__attribute__((__hot__))
+#endif
+
+#ifndef __cold
+#define __cold		__attribute__((__cold__))
+#endif
+
 #ifndef __packed
 #define __packed __attribute__((__packed__))
 #endif
@@ -30,6 +46,14 @@ typedef uint8_t u8;
 
 #define GWFTP_PATH_MAX 4096
 #define GWFTP_HANDSHAKE_MAGIC 0xaabbccdd
+
+enum {
+	GWFTP_PKT_TYPE_HANDSHAKE	= 0x01,
+	GWFTP_PKT_TYPE_HANDSHAKE_RESP	= 0x02,
+	GWFTP_PKT_TYPE_CMD		= 0x03,
+	GWFTP_PKT_TYPE_CMD_RESP		= 0x04,
+	GWFTP_PKT_TYPE_CLOSE		= 0x05,
+};
 
 struct gwftp_pkt_hdr {
 	u8	type;
@@ -86,14 +110,6 @@ struct gwftp_pkt_cmd_res {
 	u8	is_end_of_res;
 	u8	cmd;
 } __packed;
-
-enum {
-	GWFTP_PKT_TYPE_HANDSHAKE	= 0x01,
-	GWFTP_PKT_TYPE_HANDSHAKE_RESP	= 0x02,
-	GWFTP_PKT_TYPE_CMD		= 0x03,
-	GWFTP_PKT_TYPE_CMD_RESP		= 0x04,
-	GWFTP_PKT_TYPE_CLOSE		= 0x05,
-};
 
 struct gwftp_pkt {
 	struct gwftp_pkt_hdr	hdr;
@@ -175,8 +191,15 @@ struct gwftp_server_cfg {
 	uint8_t		event;
 };
 
+enum {
+	GWFTP_SRV_CL_STATE_INIT		= 0x00,
+	GWFTP_SRV_CL_STATE_HANDSHAKE	= 0x01,
+	GWFTP_SRV_CL_STATE_ESTABLISHED	= 0x02,
+};
+
 struct gwftp_client {
 	int				fd;
+	uint8_t				state;
 	struct sockaddr_storage		addr;
 	size_t				rx_len;
 	size_t				tx_len;
@@ -226,5 +249,8 @@ struct gwftp_client_ctx {
 	struct gwftp_pkt		tx_pkt;
 	struct gwftp_client_cfg		cfg;
 };
+
+int gwftp_server_validate_cl_pkt_hdr(struct gwftp_pkt *pkt, struct gwftp_client *cl);
+int gwftp_server_validate_cl_pkt_body(struct gwftp_pkt *pkt, struct gwftp_client *cl);
 
 #endif /* #ifndef GWFTP__GWFTP_H */

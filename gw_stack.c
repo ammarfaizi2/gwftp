@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stdio.h>
 
 int gwftp_stack_init(struct gw_stack *st, uint32_t size)
 {
@@ -14,7 +15,7 @@ int gwftp_stack_init(struct gw_stack *st, uint32_t size)
 	if (err)
 		return -err;
 
-	st->data = malloc(size * sizeof(uint32_t));
+	st->data = calloc(size, sizeof(*st->data));
 	if (!st->data)
 		return -ENOMEM;
 
