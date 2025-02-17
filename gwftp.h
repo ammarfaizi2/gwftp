@@ -72,11 +72,11 @@ struct gwftp_pkt_handshake {
 struct gwftp_pkt_handshake_res {
 	__be32	magic;
 	u8	status;
-	u8	resv[3];
 	u8	major;
 	u8	minor;
 	u8	patch;
 	u8	extra[29];
+	u8	resv[3];
 } __packed;
 
 enum {
@@ -112,13 +112,19 @@ struct gwftp_pkt_cmd_res {
 } __packed;
 
 struct gwftp_pkt {
-	struct gwftp_pkt_hdr	hdr;
-
 	union {
-		struct gwftp_pkt_handshake	hs;
-		struct gwftp_pkt_handshake_res	hs_res;
-		struct gwftp_pkt_cmd		cmd;
-		struct gwftp_pkt_cmd_res	cmd_res;
+		struct {
+			struct gwftp_pkt_hdr	hdr;
+
+			union {
+				struct gwftp_pkt_handshake	hs;
+				struct gwftp_pkt_handshake_res	hs_res;
+				struct gwftp_pkt_cmd		cmd;
+				struct gwftp_pkt_cmd_res	cmd_res;
+			};
+		};
+
+		char	raw[8192];
 	};
 } __packed;
 
@@ -199,6 +205,7 @@ enum {
 
 struct gwftp_client {
 	int				fd;
+	uint32_t			ep_mask;
 	uint8_t				state;
 	struct sockaddr_storage		addr;
 	size_t				rx_len;
@@ -249,5 +256,13 @@ struct gwftp_client_ctx {
 	struct gwftp_pkt		tx_pkt;
 	struct gwftp_client_cfg		cfg;
 };
+
+
+int gwftp_server_evaluate_client_packet(struct gwftp_server_ctx *ctx,
+					struct gwftp_client *cl);
+
+struct gwftp_client *gwftp_server_get_client_slot(struct gwftp_server_ctx *ctx);
+int gwftp_server_put_client_slot(struct gwftp_server_ctx *ctx,
+				 struct gwftp_client *cl);
 
 #endif /* #ifndef GWFTP__GWFTP_H */

@@ -5,22 +5,22 @@
 #include <sys/epoll.h>
 #include <stdbool.h>
 
-struct gwftp_srv_ev_epoll {
+struct epoll_obj {
 	int			ep_fd;
 	int			ev_fd;
 	int			timeout;
 	uint32_t		max_events;
 	struct epoll_event	*events;
+};
+
+struct gwftp_srv_ev_epoll {
+	struct epoll_obj	eo;
 	bool			is_accept_disabled;
 	bool			break_epoll_iter;
 };
 
 struct gwftp_cli_ev_epoll {
-	int			ep_fd;
-	int			ev_fd;
-	int			timeout;
-	uint32_t		max_events;
-	struct epoll_event	events[2];
+	struct epoll_obj	eo;
 };
 
 struct gwftp_server_ctx;

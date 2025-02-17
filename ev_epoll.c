@@ -2,6 +2,7 @@
 
 #include "ev_epoll.h"
 #include "gwftp.h"
+#include "validator.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -84,9 +85,10 @@ static int handle_accept_err(int err, struct gwftp_server_ctx *ctx)
 		 */
 		pr_info("Run out of file descriptors! Disabling accept event...");
 		data.u64 = SRV_EV_ACCEPT;
-		err = epoll_mod(ep->ep_fd, ctx->tcp_fd, EPOLLIN, data);
+		err = epoll_mod(ep->eo.ep_fd, ctx->tcp_fd, EPOLLIN, data);
 		if (err) {
-			pr_err("Failed to disable accept event: %s\n", strerror(-err));
+			pr_err("Failed to disable accept event: %s\n",
+				strerror(-err));
 			return err;
 		}
 
@@ -106,34 +108,29 @@ static int server_handle_accept(struct gwftp_server_ctx *ctx)
 	socklen_t addrlen = sizeof(addr);
 	struct gwftp_client *cl;
 	union epoll_data data;
-	uint32_t idx;
 	int fd, err;
 
 	fd = accept4(ctx->tcp_fd, (struct sockaddr *)&addr, &addrlen, flags);
 	if (fd < 0)
 		return handle_accept_err(-errno, ctx);
 
-	err = gwftp_stack_pop(&ctx->cl_stack, &idx);
-	if (err) {
+	cl = gwftp_server_get_client_slot(ctx);
+	if (!cl) {
 		close(fd);
-		pr_err("Failed to pop client from stack: %s", strerror(-err));
-		return err;
+		return handle_accept_err(-ENFILE, ctx);
 	}
 
-	cl = &ctx->clients[idx];
 	cl->fd = fd;
 	cl->addr = addr;
-	cl->rx_len = 0;
-	cl->tx_len = 0;
-	cl->state = GWFTP_CL_STATE_INIT;
+	cl->ep_mask = EPOLLIN;
 
 	data.u64 = 0;
 	data.ptr = cl;
 	data.u64 |= SRV_EV_CLIENT;
-	err = epoll_add(ep->ep_fd, fd, EPOLLIN, data);
+	err = epoll_add(ep->eo.ep_fd, fd, cl->ep_mask, data);
 	if (err) {
 		close(fd);
-		gwftp_stack_push(&ctx->cl_stack, idx);
+		gwftp_server_put_client_slot(ctx, cl);
 		pr_err("Failed to add client to epoll: %s\n", strerror(-err));
 		return err;
 	}
@@ -146,9 +143,10 @@ static int close_client(struct gwftp_server_ctx *ctx, struct gwftp_client *cl)
 	struct gwftp_srv_ev_epoll *ep = ctx->ev_epoll;
 	int err;
 
-	err = epoll_del(ep->ep_fd, cl->fd);
+	err = epoll_del(ep->eo.ep_fd, cl->fd);
 	if (err)
-		pr_err("Failed to remove client from epoll: %s\n", strerror(-err));
+		pr_err("Failed to remove client from epoll: %s\n",
+			strerror(-err));
 
 	pr_dbg("Closing client (fd=%d)", cl->fd);
 	close(cl->fd);
@@ -166,9 +164,10 @@ static int close_client(struct gwftp_server_ctx *ctx, struct gwftp_client *cl)
 		union epoll_data data;
 
 		data.u64 = SRV_EV_ACCEPT;
-		err = epoll_mod(ep->ep_fd, ctx->tcp_fd, EPOLLIN, data);
+		err = epoll_mod(ep->eo.ep_fd, ctx->tcp_fd, EPOLLIN, data);
 		if (err)
-			pr_err("Failed to enable accept event: %s\n", strerror(-err));
+			pr_err("Failed to enable accept event: %s\n",
+				strerror(-err));
 
 		ep->is_accept_disabled = false;
 		pr_info("Re-enabled accept event!");
@@ -182,70 +181,32 @@ static int close_client(struct gwftp_server_ctx *ctx, struct gwftp_client *cl)
 	return err;
 }
 
-static int server_consume_cl_packet(struct gwftp_server_ctx *ctx,
-				    struct gwftp_client *cl,
-				    struct gwftp_pkt *pkt)
+static int server_transmit_packet(struct gwftp_server_ctx *ctx,
+				  struct gwftp_client *cl)
 {
-	(void)ctx;
-	(void)cl;
-	(void)pkt;
-	return 0;
-}
-
-static int server_interpret_client_packet(struct gwftp_server_ctx *ctx,
-					  struct gwftp_client *cl)
-{
-	size_t len, expected_len;
-	struct gwftp_pkt *pkt;
-	int ret;
-
-repeat:
-	pkt = &cl->rx_pkt;
-	len = cl->rx_len;
-	if (unlikely(len < sizeof(pkt->hdr)))
-		return -EAGAIN;
-
-	pkt->hdr.len = ntohs(pkt->hdr.len);
-	ret = gwftp_server_validate_cl_pkt_hdr(pkt, cl);
-	if (unlikely(ret))
-		goto out;
-
-	expected_len = sizeof(pkt->hdr) + pkt->hdr.len;
-	if (len < expected_len) {
-		ret = -EAGAIN;
-		goto out;
-	}
-
-	ret = gwftp_server_validate_cl_pkt_body(pkt, cl);
-	if (unlikely(ret))
-		goto out;
-
-	ret = server_consume_cl_packet(ctx, cl, pkt);
-	if (likely(!ret)) {
-		cl->rx_len -= expected_len;
-		goto repeat;
-	}
-
-out:
-	pkt->hdr.len = htons(pkt->hdr.len);
-	return ret;
-}
-
-static int server_handle_client_recv(struct gwftp_server_ctx *ctx,
-				     struct gwftp_client *cl)
-{
+	struct gwftp_srv_ev_epoll *ep;
+	union epoll_data data;
 	ssize_t ret;
 	size_t len;
 	char *buf;
 
-	buf = (char *)&cl->rx_pkt + cl->rx_len;
-	len = sizeof(cl->rx_pkt) - cl->rx_len;
-	ret = recv(cl->fd, buf, len, MSG_DONTWAIT);
+repeat:
+	if (!cl->tx_len)
+		goto out;
+
+	buf = cl->tx_pkt.raw;
+	len = cl->tx_len;
+	ret = send(cl->fd, buf, len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
 		if (ret != -EAGAIN && ret != -EINTR) {
-			pr_err("Failed to receive data: %s\n", strerror(-ret));
+			pr_err("Failed to send data: %s\n", strerror(-ret));
 			return ret;
+		}
+
+		if (cl->ep_mask != EPOLLOUT) {
+			cl->ep_mask = EPOLLOUT;
+			goto out_epl_mod;
 		}
 		return 0;
 	}
@@ -253,17 +214,87 @@ static int server_handle_client_recv(struct gwftp_server_ctx *ctx,
 	if (!ret)
 		return -ECONNRESET;
 
-	cl->rx_len += (size_t)ret;
-	ret = server_interpret_client_packet(ctx, cl);
-	if (ret == -EAGAIN)
-		ret = 0;
+	cl->tx_len -= (size_t)ret;
+	if (cl->tx_len) {
+		memmove(buf, buf + ret, cl->tx_len);
+		goto repeat;
+	}
 
-	return ret;
+out:
+	if (cl->ep_mask & EPOLLOUT) {
+		cl->ep_mask = EPOLLIN;
+		goto out_epl_mod;
+	}
+
+	return 0;
+
+out_epl_mod:
+	ep = ctx->ev_epoll;
+	data.u64 = 0;
+	data.ptr = cl;
+	data.u64 |= SRV_EV_CLIENT;
+	ep->break_epoll_iter = true;
+	return epoll_mod(ep->eo.ep_fd, cl->fd, cl->ep_mask, data);
+}
+
+static ssize_t do_recv(int fd, char *buf, size_t *len, size_t max_len)
+{
+	ssize_t ret;
+
+	ret = recv(fd, buf + *len, max_len - *len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret != -EAGAIN && ret != -EINTR) {
+			pr_err("Failed to receive data: %s\n", strerror(-ret));
+			return ret;
+		}
+		return -EAGAIN;
+	}
+
+	if (!ret)
+		return -ECONNRESET;
+
+	*len += (size_t)ret;
+	return 0;
+}
+
+static int server_handle_client_recv(struct gwftp_server_ctx *ctx,
+				     struct gwftp_client *cl)
+{
+	struct gwftp_pkt *rx = &cl->rx_pkt;
+	ssize_t ret;
+
+	ret = do_recv(cl->fd, rx->raw, &cl->rx_len, sizeof(*rx));
+	if (ret)
+		goto out;
+
+	while (1) {
+		int serr;
+
+		ret = gwftp_server_evaluate_client_packet(ctx, cl);
+		if (cl->tx_len) {
+			serr = server_transmit_packet(ctx, cl);
+			if (serr)
+				return serr;
+		}
+
+		if (ret)
+			break;
+	}
+
+out:
+	return (ret == -EAGAIN) ? 0 : ret;
 }
 
 static int server_handle_client_send(struct gwftp_server_ctx *ctx,
 				     struct gwftp_client *cl)
 {
+	int serr;
+
+	serr = server_transmit_packet(ctx, cl);
+	if (serr)
+		return serr;
+
 	return 0;
 }
 
@@ -310,13 +341,12 @@ static int server_handle_event(struct gwftp_server_ctx *ctx,
 	return 0;
 }
 
-static int server_poll_events(struct gwftp_server_ctx *ctx)
+static int poll_events(struct epoll_obj *eo)
 {
-	struct gwftp_srv_ev_epoll *ep = ctx->ev_epoll;
 	int ret;
 
-	ret = epoll_wait(ep->ep_fd, ep->events, ep->max_events, ep->timeout);
-	if (unlikely(ret < 0)) {
+	ret = epoll_wait(eo->ep_fd, eo->events, eo->max_events, eo->timeout);
+	if (ret < 0) {
 		ret = -errno;
 		if (ret == -EINTR)
 			return 0;
@@ -331,7 +361,7 @@ static int server_poll_events(struct gwftp_server_ctx *ctx)
 static int server_handle_events(struct gwftp_server_ctx *ctx, int nr_events)
 {
 	struct gwftp_srv_ev_epoll *ep = ctx->ev_epoll;
-	struct epoll_event *events = ep->events;
+	struct epoll_event *events = ep->eo.events;
 	int i, ret = 0;
 
 	for (i = 0; i < nr_events; i++) {
@@ -349,49 +379,70 @@ static int server_handle_events(struct gwftp_server_ctx *ctx, int nr_events)
 }
 
 __cold
+static int init_epoll_obj(struct epoll_obj *eo, uint32_t max_events)
+{
+	int ep;
+
+	ep = epoll_create(max_events);
+	if (ep < 0) {
+		pr_err("Failed to create epoll: %s\n", strerror(-errno));
+		return -errno;
+	}
+
+	eo->ep_fd = ep;
+	eo->max_events = max_events;
+	eo->events = calloc(max_events, sizeof(*eo->events));
+	if (!eo->events) {
+		close(ep);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void free_epoll_obj(struct epoll_obj *eo)
+{
+	if (eo->ep_fd >= 0)
+		close(eo->ep_fd);
+
+	if (eo->events)
+		free(eo->events);
+}
+
+__cold
 static int server_init_epoll(struct gwftp_server_ctx *ctx)
 {
 	struct gwftp_srv_ev_epoll *ep = malloc(sizeof(*ep));
 	union epoll_data data;
 	uint32_t max;
-	int err;
+	int ret;
 
 	if (!ep)
 		return -ENOMEM;
 
-	ep->events = NULL;
-	ep->ep_fd = epoll_create(128);
-	if (ep->ep_fd < 0) {
-		err = -errno;
-		free(ep);
-		return err;
-	}
-
-	data.u64 = SRV_EV_ACCEPT;
-	err = epoll_add(ep->ep_fd, ctx->tcp_fd, EPOLLIN, data);
-	if (err) {
-		close(ep->ep_fd);
-		free(ep);
-		return err;
-	}
-
-	if (ctx->max_clients < epoll_max_events)
-		max = ctx->max_clients;
+	if (ctx->max_clients + 2 < epoll_max_events)
+		max = ctx->max_clients + 2;
 	else
 		max = epoll_max_events;
 
-	ep->events = malloc(max * sizeof(*ep->events));
-	if (!ep->events) {
-		close(ep->ep_fd);
+	ret = init_epoll_obj(&ep->eo, max);
+	if (ret) {
 		free(ep);
-		return -ENOMEM;
+		return ret;
 	}
 
-	ep->max_events = max;
-	ep->timeout = -1;
-	ep->is_accept_disabled = false;
-	ctx->ev_epoll = ep;
+	data.u64 = SRV_EV_ACCEPT;
+	ret = epoll_add(ep->eo.ep_fd, ctx->tcp_fd, EPOLLIN, data);
+	if (ret) {
+		free_epoll_obj(&ep->eo);
+		free(ep);
+		return ret;
+	}
 
+	ep->eo.timeout = -1;
+	ep->is_accept_disabled = false;
+	ep->break_epoll_iter = false;
+	ctx->ev_epoll = ep;
 	return 0;
 }
 
@@ -402,12 +453,7 @@ static void server_free_epoll(struct gwftp_server_ctx *ctx)
 	if (!ep)
 		return;
 
-	if (ep->events)
-		free(ep->events);
-
-	if (ep->ep_fd >= 0)
-		close(ep->ep_fd);
-
+	free_epoll_obj(&ep->eo);
 	free(ep);
 }
 
@@ -421,7 +467,7 @@ int gwftp_server_run_ev_epoll(struct gwftp_server_ctx *ctx)
 		return ret;
 
 	while (!ctx->should_stop) {
-		ret = server_poll_events(ctx);
+		ret = poll_events(&ctx->ev_epoll->eo);
 		if (unlikely(ret < 0))
 			break;
 
@@ -431,24 +477,6 @@ int gwftp_server_run_ev_epoll(struct gwftp_server_ctx *ctx)
 	}
 
 	server_free_epoll(ctx);
-	return ret;
-}
-
-static int client_poll_events(struct gwftp_client_ctx *ctx)
-{
-	struct gwftp_cli_ev_epoll *ep = ctx->ev_epoll;
-	int ret;
-
-	ret = epoll_wait(ep->ep_fd, ep->events, 2, ep->timeout);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EINTR)
-			return 0;
-
-		pr_err("Failed to wait for events: %s\n", strerror(-ret));
-		return ret;
-	}
-
 	return ret;
 }
 
@@ -528,7 +556,7 @@ static int client_handle_event(struct gwftp_client_ctx *ctx,
 static int client_handle_events(struct gwftp_client_ctx *ctx, int nr_events)
 {
 	struct gwftp_cli_ev_epoll *ep = ctx->ev_epoll;
-	struct epoll_event *events = ep->events;
+	struct epoll_event *events = ep->eo.events;
 	int i, ret = 0;
 
 	for (i = 0; i < nr_events; i++) {
@@ -558,7 +586,8 @@ static int client_send_handshake(struct gwftp_client_ctx *ctx)
 	}
 
 	if ((size_t)ret != len) {
-		pr_err("Failed to send complete handshake: %s\n", strerror(-EIO));
+		pr_err("Failed to send complete handshake: %s\n",
+			strerror(-EIO));
 		return -EIO;
 	}
 
@@ -576,24 +605,22 @@ static int client_init_epoll(struct gwftp_client_ctx *ctx)
 	if (!ep)
 		return -ENOMEM;
 
-	ep->ep_fd = epoll_create(2);
-	if (ep->ep_fd < 0) {
-		err = -errno;
+	err = init_epoll_obj(&ep->eo, 2);
+	if (err) {
 		free(ep);
 		return err;
 	}
 
 	data.u64 = CLI_EV_SERVER;
-	err = epoll_add(ep->ep_fd, ctx->tcp_fd, EPOLLIN, data);
+	err = epoll_add(ep->eo.ep_fd, ctx->tcp_fd, EPOLLIN, data);
 	if (err) {
-		close(ep->ep_fd);
+		free_epoll_obj(&ep->eo);
 		free(ep);
 		return err;
 	}
 
-	ep->timeout = -1;
+	ep->eo.timeout = -1;
 	ctx->ev_epoll = ep;
-
 	return 0;
 }
 
@@ -604,9 +631,7 @@ static void client_free_epoll(struct gwftp_client_ctx *ctx)
 	if (!ep)
 		return;
 
-	if (ep->ep_fd >= 0)
-		close(ep->ep_fd);
-
+	free_epoll_obj(&ep->eo);
 	free(ep);
 }
 
@@ -625,7 +650,7 @@ int gwftp_client_run_ev_epoll(struct gwftp_client_ctx *ctx)
 		return ret;
 
 	while (!ctx->should_stop) {
-		ret = client_poll_events(ctx);
+		ret = poll_events(&ctx->ev_epoll->eo);
 		if (unlikely(ret < 0))
 			break;
 

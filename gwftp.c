@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include "gwftp.h"
+#include "validator.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +70,7 @@ static int resolve_addr(struct sockaddr_storage *ss, const char *addr,
 		break;
 	default:
 		pr_err("Unsupported address family: %d", ss->ss_family);
-		return -EINVAL;
+		return -EAFNOSUPPORT;
 	}
 
 	return 0;
@@ -199,7 +200,8 @@ static int server_init_sock(struct gwftp_server_ctx *ctx)
 
 	ctx->tcp_fd = fd;
 
-	pr_info("Listening on %s:%hu...", ctx->cfg.bind_addr, ctx->cfg.bind_port);
+	pr_info("Listening on %s:%hu...", ctx->cfg.bind_addr,
+		ctx->cfg.bind_port);
 	return 0;
 
 out_err:
@@ -453,7 +455,8 @@ static int client_init_sock(struct gwftp_client_ctx *ctx)
 		return err;
 	}
 
-	pr_info("Connecting to %s:%hu...", ctx->cfg.server_addr, ctx->cfg.server_port);
+	pr_info("Connecting to %s:%hu...", ctx->cfg.server_addr,
+		ctx->cfg.server_port);
 	err = connect(fd, (struct sockaddr *)&addr, addr_len);
 	if (err) {
 		struct pollfd pfd = { .fd = fd, .events = POLLOUT };
@@ -477,7 +480,8 @@ static int client_init_sock(struct gwftp_client_ctx *ctx)
 	}
 
 	ctx->tcp_fd = fd;
-	pr_info("Connected to %s:%hu...", ctx->cfg.server_addr, ctx->cfg.server_port);
+	pr_info("Connected to %s:%hu...", ctx->cfg.server_addr,
+		ctx->cfg.server_port);
 	return 0;
 }
 
@@ -626,14 +630,107 @@ out:
 	return err;
 }
 
-static int server_consume_cl_packet(struct gwftp_server_ctx *ctx,
-				    struct gwftp_client *cl,
-				    struct gwftp_pkt *pkt)
+static int gwftp_server_handle_handshake(struct gwftp_server_ctx *ctx,
+					 struct gwftp_client *cl,
+					 struct gwftp_pkt *pkt)
 {
-	(void)ctx;
-	(void)cl;
-	(void)pkt;
+	cl->state = GWFTP_SRV_CL_STATE_ESTABLISHED;
+	cl->tx_len = prep_pkt_handshake_res(&cl->tx_pkt, 0,
+					    GWFTP_VERSION_MAJOR,
+					    GWFTP_VERSION_MINOR,
+					    GWFTP_VERSION_PATCH,
+					    GWFTP_VERSION_EXTRA);
+
+	pr_dbg("Handshake completed!");
 	return 0;
+}
+
+static int gwftp_server_consume_cl_packet(struct gwftp_server_ctx *ctx,
+					  struct gwftp_client *cl)
+{
+	struct gwftp_pkt *pkt = &cl->rx_pkt;
+
+	switch (pkt->hdr.type) {
+	case GWFTP_PKT_TYPE_HANDSHAKE:
+		assert(cl->state == GWFTP_SRV_CL_STATE_HANDSHAKE);
+		return gwftp_server_handle_handshake(ctx, cl, pkt);
+	default:
+		pr_dbg("Unsupported packet type: 0x%02x", pkt->hdr.type);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+__hot
+int gwftp_server_evaluate_client_packet(struct gwftp_server_ctx *ctx,
+					struct gwftp_client *cl)
+{
+	size_t len, expected_len;
+	struct gwftp_pkt *pkt;
+	int ret;
+
+	pkt = &cl->rx_pkt;
+	len = cl->rx_len;
+	if (unlikely(len < sizeof(pkt->hdr)))
+		return -EAGAIN;
+
+	pkt->hdr.len = ntohs(pkt->hdr.len);
+	ret = gwftp_server_validate_cl_pkt_hdr(cl);
+	if (unlikely(ret))
+		goto out;
+
+	expected_len = sizeof(pkt->hdr) + pkt->hdr.len;
+	if (len < expected_len) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	ret = gwftp_server_validate_cl_pkt_body(cl);
+	if (unlikely(ret))
+		goto out;
+
+	ret = gwftp_server_consume_cl_packet(ctx, cl);
+	if (likely(!ret)) {
+		cl->rx_len -= expected_len;
+		memmove(cl->rx_pkt.raw, cl->rx_pkt.raw + expected_len, cl->rx_len);
+		return 0;
+	}
+
+out:
+	pkt->hdr.len = htons(pkt->hdr.len);
+	return ret;
+}
+
+__hot
+struct gwftp_client *gwftp_server_get_client_slot(struct gwftp_server_ctx *ctx)
+{
+	struct gwftp_client *cl;
+	uint32_t idx;
+	int err;
+
+	err = gwftp_stack_pop(&ctx->cl_stack, &idx);
+	if (err)
+		return NULL;
+
+	cl = &ctx->clients[idx];
+	cl->fd = -1;
+	cl->state = GWFTP_SRV_CL_STATE_HANDSHAKE;
+	cl->rx_len = 0;
+	cl->tx_len = 0;
+	return cl;
+}
+
+__hot
+int gwftp_server_put_client_slot(struct gwftp_server_ctx *ctx,
+				 struct gwftp_client *cl)
+{
+	uint32_t idx = cl - ctx->clients;
+
+	cl->fd = -1;
+	cl->state = GWFTP_SRV_CL_STATE_INIT;
+	cl->rx_len = 0;
+	cl->tx_len = 0;
+	return gwftp_stack_push(&ctx->cl_stack, idx);
 }
 
 int main(int argc, char *argv[])

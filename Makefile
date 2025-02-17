@@ -8,7 +8,7 @@ EXTRAVERSION =
 CC ?= gcc
 CXX ?= g++
 
-SOURCES	= \
+C_SOURCES = \
 	ev_epoll.c \
 	ev_io_uring.c \
 	gw_stack.c \
@@ -31,10 +31,19 @@ LDLIBS		= -lpthread
 
 all: gwftp
 
-gwftp: $(SOURCES:.c=.o)
-	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+gwftp: $(C_SOURCES:.c=.o)
+	@$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	@echo "    LD    $@"
 
--include $(SOURCES:.c=.d)
+%.o: %.c
+	@$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "    CC    $@"
+
+%.o: %.cpp
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
+	@echo "    CXX   $@"
+
+-include $(C_SOURCES:.c=.d)
 
 clean:
 	rm -vf gwftp *.o *.d
