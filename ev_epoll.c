@@ -480,37 +480,65 @@ int gwftp_server_run_ev_epoll(struct gwftp_server_ctx *ctx)
 	return ret;
 }
 
-static int client_handle_server_recv(struct gwftp_client_ctx *ctx)
+static int client_transmit_packet(struct gwftp_client_ctx *ctx)
 {
+	struct gwftp_pkt *tx = &ctx->tx_pkt;
 	ssize_t ret;
 	size_t len;
-	char *buf;
 
-	buf = (char *)&ctx->rx_pkt + ctx->rx_len;
-	len = sizeof(ctx->rx_pkt) - ctx->rx_len;
-	ret = recv(ctx->tcp_fd, buf, len, MSG_DONTWAIT);
+	len = ctx->tx_len;
+	ret = send(ctx->tcp_fd, tx->raw, len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
 		if (ret != -EAGAIN && ret != -EINTR) {
-			pr_err("Failed to receive data: %s\n", strerror(-ret));
+			pr_err("Failed to send data: %s\n", strerror(-ret));
 			return ret;
 		}
 
 		return 0;
 	}
 
-	if (unlikely(!ret)) {
-		pr_err("Server disconnected!");
-		ctx->should_stop = true;
+	if (!ret)
 		return -ECONNRESET;
-	}
+
+	ctx->tx_len -= (size_t)ret;
+	if (ctx->tx_len)
+		memmove(tx->raw, tx->raw + ret, ctx->tx_len);
 
 	return 0;
+}
+
+static int client_handle_server_recv(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt *rx = &ctx->rx_pkt;
+	ssize_t ret;
+
+	ret = do_recv(ctx->tcp_fd, rx->raw, &ctx->rx_len, sizeof(*rx));
+	if (ret)
+		goto out;
+
+	while (1) {
+		int serr;
+
+		ret = gwftp_client_evaluate_server_packet(ctx);
+		if (ctx->tx_len) {
+			serr = client_transmit_packet(ctx);
+			if (serr)
+				return serr;
+		}
+
+		if (ret)
+			break;
+	}
+
+out:
+	return (ret == -EAGAIN) ? 0 : ret;
 }
 
 static int client_handle_server_send(struct gwftp_client_ctx *ctx)
 {
 	return 0;
+	(void)ctx;
 }
 
 static int client_handle_server(struct gwftp_client_ctx *ctx, uint32_t events)

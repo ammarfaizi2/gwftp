@@ -99,7 +99,6 @@ static int server_setup_sigaction(struct gwftp_server_ctx *ctx)
 	s_ctx = ctx;
 	err |= sigaction(SIGINT, &sa, NULL);
 	err |= sigaction(SIGTERM, &sa, NULL);
-	err |= sigaction(SIGQUIT, &sa, NULL);
 	sa.sa_handler = SIG_IGN;
 	err |= sigaction(SIGPIPE, &sa, NULL);
 	if (err) {
@@ -392,10 +391,8 @@ static struct gwftp_client_ctx *c_ctx;
 
 static void client_sig_handler(int signum)
 {
-	if (c_ctx && !c_ctx->should_stop) {
-		putchar('\n');
+	if (c_ctx && !c_ctx->should_stop)
 		c_ctx->should_stop = true;
-	}
 
 	(void)signum;
 }
@@ -411,7 +408,6 @@ static int client_setup_sigaction(struct gwftp_client_ctx *ctx)
 	c_ctx = ctx;
 	err |= sigaction(SIGINT, &sa, NULL);
 	err |= sigaction(SIGTERM, &sa, NULL);
-	err |= sigaction(SIGQUIT, &sa, NULL);
 	sa.sa_handler = SIG_IGN;
 	err |= sigaction(SIGPIPE, &sa, NULL);
 	if (err) {
@@ -499,6 +495,7 @@ static int client_init_ctx(struct gwftp_client_ctx *ctx)
 
 	ctx->should_stop = false;
 	ctx->tcp_fd = -1;
+	ctx->last_cmd_id = 0;
 
 	err = client_setup_sigaction(ctx);
 	if (err)
@@ -601,6 +598,7 @@ static int gwftp_client_run(int argc, char *argv[], const char *app)
 	struct gwftp_client_ctx ctx;
 	int err;
 
+	memset(&ctx, 0, sizeof(ctx));
 	err = client_parse_args(argc, argv, app, &ctx.cfg);
 	if (err) {
 		client_free_cfg(&ctx.cfg);
@@ -630,9 +628,7 @@ out:
 	return err;
 }
 
-static int gwftp_server_handle_handshake(struct gwftp_server_ctx *ctx,
-					 struct gwftp_client *cl,
-					 struct gwftp_pkt *pkt)
+static int gwftp_server_handle_handshake(struct gwftp_client *cl)
 {
 	cl->state = GWFTP_SRV_CL_STATE_ESTABLISHED;
 	cl->tx_len = prep_pkt_handshake_res(&cl->tx_pkt, 0,
@@ -653,12 +649,14 @@ static int gwftp_server_consume_cl_packet(struct gwftp_server_ctx *ctx,
 	switch (pkt->hdr.type) {
 	case GWFTP_PKT_TYPE_HANDSHAKE:
 		assert(cl->state == GWFTP_SRV_CL_STATE_HANDSHAKE);
-		return gwftp_server_handle_handshake(ctx, cl, pkt);
+		return gwftp_server_handle_handshake(cl);
 	default:
 		pr_dbg("Unsupported packet type: 0x%02x", pkt->hdr.type);
 		return -EINVAL;
 	}
 	return 0;
+
+	(void)ctx;
 }
 
 __hot
@@ -731,6 +729,174 @@ int gwftp_server_put_client_slot(struct gwftp_server_ctx *ctx,
 	cl->rx_len = 0;
 	cl->tx_len = 0;
 	return gwftp_stack_push(&ctx->cl_stack, idx);
+}
+
+static bool my_isspace(char c)
+{
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static void trim_and_move(char *buf, size_t len)
+{
+	size_t i, j;
+
+	for (i = 0; i < len; i++) {
+		if (!my_isspace(buf[i]))
+			break;
+	}
+
+	for (j = len - 1; j > i; j--) {
+		if (!my_isspace(buf[j]))
+			break;
+	}
+
+	memmove(buf, buf + i, j - i + 1);
+	buf[j - i + 1] = '\0';
+}
+
+static ssize_t read_cmd_line(char *buf, size_t max_len)
+{
+	char *p;
+
+	p = fgets(buf, max_len, stdin);
+	if (!p) {
+		putchar('\n');
+		pr_info("Exiting...");
+		return -EIO;
+	}
+
+	trim_and_move(buf, strlen(buf));
+	return strlen(buf);
+}
+
+static int evaluate_cmd(struct gwftp_client_ctx *ctx)
+{
+	char *cmd = ctx->sh_buf;
+	char *arg = strchr(cmd, ' ');
+
+	if (arg) {
+		*arg = '\0';
+		arg++;
+	}
+
+	if (!strcmp(cmd, "exit") || !strcmp(cmd, "quit") || !strcmp(cmd, "q")) {
+		pr_info("Exiting...");
+		ctx->should_stop = true;
+		return 0;
+	}
+
+	if (!strcmp(cmd, "clear")) {
+		printf("\ec");
+		printf("\033[H\033[J");
+		return 0;
+	}
+
+	if (!strcmp(cmd, "ls")) {
+		ctx->tx_len = prep_pkt_cmd(&ctx->tx_pkt, GWFTP_CMD_LS,
+					   ++ctx->last_cmd_id, 0, arg);
+		return 0;
+	}
+
+	if (!strcmp(cmd, "help")) {
+		printf("Commands:\n");
+		printf("  clear\t\tClear the screen\n");
+		printf("  exit\t\tExit the program\n");
+		printf("  quit\t\tExit the program\n");
+		printf("  ls\t\tList files in the current server directory\n");
+		printf("  help\t\tDisplay this help message\n");
+		return 0;
+	}
+
+	printf("Unknown command: %s\n", cmd);
+	printf("Type 'help' for a list of commands\n");
+	return 0;
+}
+
+static int gwftp_client_shell(struct gwftp_client_ctx *ctx)
+{
+	ssize_t ret;
+
+	while (!ctx->should_stop) {
+		printf("gwftp > ");
+		fflush(stdout);
+
+		ret = read_cmd_line(ctx->sh_buf, sizeof(ctx->sh_buf));
+		if (ret < 0)
+			break;
+
+		ctx->sh_len = (size_t)ret;
+		if (!ctx->sh_len)
+			continue;
+
+		ret = evaluate_cmd(ctx);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+static int gwftp_client_handle_handshake(struct gwftp_client_ctx *ctx)
+{
+	int ret;
+
+	ctx->state = GWFTP_CL_STATE_ESTABLISHED;
+	pr_info("Connection established!");
+	ret = gwftp_client_shell(ctx);
+	return (ret < 0) ? ret : 0;
+}
+
+static int gwftp_client_consume_sr_packet(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt *pkt = &ctx->rx_pkt;
+
+	switch (pkt->hdr.type) {
+	case GWFTP_PKT_TYPE_HANDSHAKE_RES:
+		assert(ctx->state == GWFTP_CL_STATE_HANDSHAKE);
+		return gwftp_client_handle_handshake(ctx);
+	default:
+		pr_dbg("Unsupported packet type: 0x%02x", pkt->hdr.type);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+__hot
+int gwftp_client_evaluate_server_packet(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt *pkt = &ctx->rx_pkt;
+	size_t len, expected_len;
+	int ret;
+
+	len = ctx->rx_len;
+	if (unlikely(len < sizeof(pkt->hdr)))
+		return -EAGAIN;
+
+	pkt->hdr.len = ntohs(pkt->hdr.len);
+	ret = gwftp_client_validate_sr_pkt_hdr(ctx);
+	if (unlikely(ret))
+		goto out;
+
+	expected_len = sizeof(pkt->hdr) + pkt->hdr.len;
+	if (len < expected_len) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	ret = gwftp_client_validate_sr_pkt_body(ctx);
+	if (unlikely(ret))
+		goto out;
+
+	ret = gwftp_client_consume_sr_packet(ctx);
+	if (likely(!ret)) {
+		ctx->rx_len -= expected_len;
+		memmove(ctx->rx_pkt.raw, ctx->rx_pkt.raw + expected_len, ctx->rx_len);
+		return 0;
+	}
+
+out:
+	pkt->hdr.len = htons(pkt->hdr.len);
+	return ret;
 }
 
 int main(int argc, char *argv[])

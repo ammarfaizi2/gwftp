@@ -30,7 +30,7 @@ int gwftp_server_validate_cl_pkt_hdr(struct gwftp_client *cl)
 	int ret;
 
 	if (unlikely(pkt->hdr.resv)) {
-		pr_err("Invalid reserved field: %u, expected 0", pkt->hdr.resv);
+		pr_dbg("Invalid reserved field: %u, expected 0", pkt->hdr.resv);
 		return -EBADMSG;
 	}
 
@@ -66,7 +66,7 @@ static int server_validate_cl_pkt_body_handshake(struct gwftp_pkt *pkt)
 	return 0;
 
 out_not_supported:
-	pr_dbg("Unsupported GWFTP version: %u.%u.%u-%s", hs->major, hs->minor,
+	pr_dbg("Unsupported client GWFTP version: %u.%u.%u-%s", hs->major, hs->minor,
 	       hs->patch, hs->extra);
 	return -ENOTSUP;
 }
@@ -88,5 +88,92 @@ int gwftp_server_validate_cl_pkt_body(struct gwftp_client *cl)
 	}
 
 	(void)cl;
+	return ret;
+}
+
+static int client_validate_sr_pkt_hdr_handshake_res(struct gwftp_pkt *pkt,
+						    struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt_hdr *hdr = &pkt->hdr;
+
+	if (unlikely(ctx->state != GWFTP_CL_STATE_HANDSHAKE)) {
+		pr_err("Handshake response packet received in invalid state: %u",
+		       ctx->state);
+		return -EBADMSG;
+	}
+
+	if (unlikely(hdr->len != sizeof(struct gwftp_pkt_handshake_res))) {
+		pr_err("Invalid handshake response packet length: %u, expected %zu",
+		       hdr->len, sizeof(struct gwftp_pkt_handshake_res));
+		return -EBADMSG;
+	}
+
+	return 0;
+}
+
+__hot
+int gwftp_client_validate_sr_pkt_hdr(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt *pkt = &ctx->rx_pkt;
+	int ret;
+
+	if (unlikely(pkt->hdr.resv)) {
+		pr_err("Invalid reserved field: %u, expected 0", pkt->hdr.resv);
+		return -EBADMSG;
+	}
+
+	switch (pkt->hdr.type) {
+	case GWFTP_PKT_TYPE_HANDSHAKE_RES:
+		ret = client_validate_sr_pkt_hdr_handshake_res(pkt, ctx);
+		break;
+	default:
+		pr_err("Unsupported packet type: %u", pkt->hdr.type);
+		ret = -EBADMSG;
+		break;
+	}
+
+	return ret;
+}
+
+static int client_validate_sr_pkt_body_handshake_res(struct gwftp_pkt *pkt)
+{
+	struct gwftp_pkt_handshake_res *hs = &pkt->hs_res;
+
+	if (unlikely(ntohl(hs->magic) != GWFTP_HANDSHAKE_MAGIC)) {
+		pr_err("Invalid GWFTP magic: 0x%08x, expected 0x%08x", hs->magic,
+		       GWFTP_HANDSHAKE_MAGIC);
+		return -EBADMSG;
+	}
+
+	hs->extra[sizeof(hs->extra) - 1] = '\0';
+	if (unlikely(hs->major != GWFTP_VERSION_MAJOR))
+		goto out_not_supported;
+	if (unlikely(hs->minor != GWFTP_VERSION_MINOR))
+		goto out_not_supported;
+
+	return 0;
+
+out_not_supported:
+	pr_err("Unsupported server GWFTP version: %u.%u.%u-%s", hs->major, hs->minor,
+	       hs->patch, hs->extra);
+	return -ENOTSUP;
+}
+
+__hot
+int gwftp_client_validate_sr_pkt_body(struct gwftp_client_ctx *ctx)
+{
+	struct gwftp_pkt *pkt = &ctx->rx_pkt;
+	int ret;
+
+	switch (pkt->hdr.type) {
+	case GWFTP_PKT_TYPE_HANDSHAKE_RES:
+		ret = client_validate_sr_pkt_body_handshake_res(pkt);
+		break;
+	default:
+		pr_err("Unsupported packet type: %u", pkt->hdr.type);
+		ret = -EBADMSG;
+		break;
+	}
+
 	return ret;
 }

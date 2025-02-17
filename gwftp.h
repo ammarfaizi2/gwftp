@@ -49,9 +49,9 @@ typedef uint8_t u8;
 
 enum {
 	GWFTP_PKT_TYPE_HANDSHAKE	= 0x01,
-	GWFTP_PKT_TYPE_HANDSHAKE_RESP	= 0x02,
+	GWFTP_PKT_TYPE_HANDSHAKE_RES	= 0x02,
 	GWFTP_PKT_TYPE_CMD		= 0x03,
-	GWFTP_PKT_TYPE_CMD_RESP		= 0x04,
+	GWFTP_PKT_TYPE_CMD_RES		= 0x04,
 	GWFTP_PKT_TYPE_CLOSE		= 0x05,
 };
 
@@ -159,20 +159,25 @@ static inline size_t prep_pkt_handshake_res(struct gwftp_pkt *pkt, u8 status,
 	pkt->hs_res.minor = minor;
 	pkt->hs_res.patch = patch;
 	strncpy((char *)pkt->hs_res.extra, extra, sizeof(pkt->hs_res.extra));
-	return prep_pkt(pkt, GWFTP_PKT_TYPE_HANDSHAKE_RESP, sizeof(pkt->hs_res));
+	return prep_pkt(pkt, GWFTP_PKT_TYPE_HANDSHAKE_RES, sizeof(pkt->hs_res));
 }
 
 static inline size_t prep_pkt_cmd(struct gwftp_pkt *pkt, u8 cmd, __be64 id,
 				  __be64 flags, const char *arg)
 {
-	size_t len = strlen(arg);
+	size_t len = (arg) ? strlen(arg) : 0;
 	size_t pkt_len = offsetof(struct gwftp_pkt_cmd, arg) + len;
 
 	pkt->cmd.id = id;
 	pkt->cmd.flags = flags;
 	pkt->cmd.arg_len = htons(len);
 	pkt->cmd.cmd = cmd;
-	strncpy((char *)pkt->cmd.arg, arg, sizeof(pkt->cmd.arg));
+
+	pkt->cmd.arg[0] = '\0';
+	if (arg)
+		strncpy((char *)pkt->cmd.arg, arg, sizeof(pkt->cmd.arg) - 1);
+	pkt->cmd.arg[sizeof(pkt->cmd.arg) - 1] = '\0';
+
 	return prep_pkt(pkt, GWFTP_PKT_TYPE_CMD, pkt_len);
 }
 
@@ -182,7 +187,7 @@ static inline size_t prep_pkt_cmd_res(struct gwftp_pkt *pkt, u8 cmd, __be64 id,
 	pkt->cmd_res.id = id;
 	pkt->cmd_res.cmd = cmd;
 	pkt->cmd_res.is_end_of_res = is_end_of_res;
-	return prep_pkt(pkt, GWFTP_PKT_TYPE_CMD_RESP, sizeof(pkt->cmd_res));
+	return prep_pkt(pkt, GWFTP_PKT_TYPE_CMD_RES, sizeof(pkt->cmd_res));
 }
 
 enum {
@@ -243,6 +248,7 @@ enum {
 
 struct gwftp_client_ctx {
 	volatile bool			should_stop;
+	uint64_t			last_cmd_id;
 	uint8_t				state;
 	int				tcp_fd;
 
@@ -255,6 +261,9 @@ struct gwftp_client_ctx {
 	struct gwftp_pkt		rx_pkt;
 	struct gwftp_pkt		tx_pkt;
 	struct gwftp_client_cfg		cfg;
+
+	size_t				sh_len;
+	char				sh_buf[4096];
 };
 
 
@@ -264,5 +273,7 @@ int gwftp_server_evaluate_client_packet(struct gwftp_server_ctx *ctx,
 struct gwftp_client *gwftp_server_get_client_slot(struct gwftp_server_ctx *ctx);
 int gwftp_server_put_client_slot(struct gwftp_server_ctx *ctx,
 				 struct gwftp_client *cl);
+
+int gwftp_client_evaluate_server_packet(struct gwftp_client_ctx *ctx);
 
 #endif /* #ifndef GWFTP__GWFTP_H */

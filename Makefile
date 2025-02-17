@@ -32,16 +32,16 @@ LDLIBS		= -lpthread
 all: gwftp
 
 gwftp: $(C_SOURCES:.c=.o)
-	@$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	@echo "    LD    $@"
+	@$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
-	@$(CC) $(CFLAGS) -c -o $@ $<
 	@echo "    CC    $@"
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 %.o: %.cpp
-	@$(CXX) $(CXXFLAGS) -c -o $@ $<
 	@echo "    CXX   $@"
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 -include $(C_SOURCES:.c=.d)
 
